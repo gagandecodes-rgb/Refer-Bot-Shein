@@ -2,14 +2,18 @@
 /**
  * ✅ FULL SINGLE index.php (Telegram Bot Webhook + Website Verify in SAME file)
  *
+ * ✅ MULTIPLE ADMINS (NEW METHOD)
+ *   - Use ENV: ADMIN_IDS="123,456,789"  (comma-separated Telegram numeric IDs)
+ *   - Any admin can open Admin Panel + manage coupons/points
+ *   - All admins get notification when any user redeems a coupon
+ *
  * ✅ FIXED: Referral counting
  * ✅ FIXED: Verify flow (old-PHP safe cookie + better DB errors)
  * ✅ BIG bottom reply keyboard buttons (user + admin)
  * ✅ Inline buttons for join/verify + withdraw + admin pickers
- * ✅ Admin notification when any user redeems coupon
  *
  * REQUIRED ENV (Render):
- * BOT_TOKEN, ADMIN_ID, BOT_USERNAME (no @)
+ * BOT_TOKEN, ADMIN_IDS, BOT_USERNAME (no @)
  * DB_HOST, DB_PORT(5432), DB_NAME(postgres), DB_USER, DB_PASS
  * FORCE_JOIN_1..FORCE_JOIN_8 (optional)
  */
@@ -32,8 +36,9 @@ define("TG_TIMEOUT", 6);
 
 /* ================= ENV ================= */
 $BOT_TOKEN    = getenv("BOT_TOKEN");
-$ADMIN_ID     = getenv("ADMIN_ID");
 $BOT_USERNAME = getenv("BOT_USERNAME"); // without @
+
+$ADMIN_IDS = array_values(array_filter(array_map('trim', explode(',', getenv("ADMIN_IDS") ?: ""))));
 
 $DB_HOST = getenv("DB_HOST");
 $DB_PORT = getenv("DB_PORT") ?: "5432";
@@ -112,9 +117,19 @@ function answerCallback($callback_id, $text = "", $alert = false) {
   ]);
 }
 
+/* ================= MULTI ADMIN ================= */
 function isAdmin($tg_id) {
-  global $ADMIN_ID;
-  return (string)$tg_id === (string)$ADMIN_ID;
+  global $ADMIN_IDS;
+  if (!$ADMIN_IDS) return false;
+  return in_array((string)$tg_id, array_map("strval", $ADMIN_IDS), true);
+}
+function notifyAdmins($text) {
+  global $ADMIN_IDS;
+  if (!$ADMIN_IDS) return;
+  foreach ($ADMIN_IDS as $aid) {
+    $aid = trim((string)$aid);
+    if ($aid !== "") sendMessage($aid, $text);
+  }
 }
 
 function normalizeChannel($s) {
@@ -178,7 +193,7 @@ function allJoined($tg_id) {
 }
 
 /* ================= BIG BUTTONS (REPLY KEYBOARD) ================= */
-function userReplyKeyboard($isAdmin = false) {
+function userReplyKeyboard($isAdminFlag = false) {
   $kb = [
     "keyboard" => [
       [ ["text"=>"📊 Stats"], ["text"=>"🎉 Withdraw"] ],
@@ -188,7 +203,7 @@ function userReplyKeyboard($isAdmin = false) {
     "is_persistent" => true,
     "one_time_keyboard" => false
   ];
-  if ($isAdmin) $kb["keyboard"][] = [ ["text"=>"🛠 Admin Panel"] ];
+  if ($isAdminFlag) $kb["keyboard"][] = [ ["text"=>"🛠 Admin Panel"] ];
   return $kb;
 }
 
@@ -245,7 +260,6 @@ function upsertUser($tg_id, $referred_by = null) {
       ->execute([":tg" => $tg_id, ":ref" => $referred_by]);
   return getUser($tg_id);
 }
-
 function ensureUserExists($tg_id) { return upsertUser($tg_id, null); }
 
 function isVerifiedUser($tg_id) {
@@ -474,7 +488,6 @@ if (isset($update["message"])) {
   // ---- ADMIN STATES (text input) ----
   $state = getState($from_id);
 
-  // Admin: waiting coupon codes for amount
   if (isAdmin($from_id) && preg_match("/^await_coupon_(500|1000|2000|4000)$/", $state, $mm) && $text !== "" && strpos($text, "/") !== 0) {
     $amount = (int)$mm[1];
     $codes = preg_split("/\r\n|\n|\r|,|\s+/", $text);
@@ -495,7 +508,6 @@ if (isset($update["message"])) {
     http_response_code(200); echo "OK"; exit;
   }
 
-  // Admin: waiting points number for amount
   if (isAdmin($from_id) && preg_match("/^setp_(500|1000|2000|4000)$/", $state, $mm) && $text !== "" && strpos($text, "/") !== 0) {
     $amount = (int)$mm[1];
     $pts = (int)$text;
@@ -625,7 +637,6 @@ if (isset($update["callback_query"])) {
   answerCallback($cq["id"], "…");
   ensureUserExists($from_id);
 
-  // ---- Force join check ----
   if ($data === "check_join") {
     if (allJoined($from_id)) {
       sendMessage($chat_id, "✅ <b>Channel join verified!</b>\nNow verify on website.");
@@ -637,7 +648,6 @@ if (isset($update["callback_query"])) {
     http_response_code(200); echo "OK"; exit;
   }
 
-  // ---- Check verified ----
   if ($data === "check_verified") {
     if (isVerifiedUser($from_id)) {
       sendMessage($chat_id, "✅ <b>Verified Successfully!</b>", userReplyKeyboard(isAdmin($from_id)));
@@ -652,16 +662,13 @@ if (isset($update["callback_query"])) {
     http_response_code(200); echo "OK"; exit;
   }
 
-  // block if not verified
   if (!isVerifiedUser($from_id)) {
     sendMessage($chat_id, "🔐 Please verify first.\nJoin channels then press <b>Check Verification</b>.", joinMarkup());
     http_response_code(200); echo "OK"; exit;
   }
 
-  // ---- Withdraw process ----
+  // ---- Withdraw ----
   if (preg_match("/^wd_(500|1000|2000|4000)$/", $data, $m)) {
-    global $ADMIN_ID;
-
     $amount = (int)$m[1];
     $need = getWithdrawPoints($amount);
     $u = getUser($from_id);
@@ -706,20 +713,18 @@ if (isset($update["callback_query"])) {
 
       $pdo->commit();
 
-      // user success
+      // user message
       sendMessage($chat_id, "🎉 <b>Coupon Redeemed!</b>\n\n<code>{$coupon['code']}</code>", userReplyKeyboard(isAdmin($from_id)));
 
-      // ✅ ADMIN NOTIFICATION
-      if (!empty($ADMIN_ID)) {
-        $adminMsg =
-          "🔔 <b>New Redeem</b>\n\n"
-          ."👤 User: <code>{$from_id}</code>\n"
-          ."💰 Amount: <b>{$amount}</b>\n"
-          ."🎟 Coupon: <code>{$coupon['code']}</code>\n"
-          ."⭐ Points Deducted: <b>{$need}</b>\n"
-          ."🕒 Time: <code>".date("Y-m-d H:i:s")."</code>";
-        sendMessage($ADMIN_ID, $adminMsg);
-      }
+      // ✅ notify ALL admins
+      $adminMsg =
+        "🔔 <b>New Redeem</b>\n\n"
+        ."👤 User: <code>{$from_id}</code>\n"
+        ."💰 Amount: <b>{$amount}</b>\n"
+        ."🎟 Coupon: <code>{$coupon['code']}</code>\n"
+        ."⭐ Points Deducted: <b>{$need}</b>\n"
+        ."🕒 Time: <code>".date("Y-m-d H:i:s")."</code>";
+      notifyAdmins($adminMsg);
 
       http_response_code(200); echo "OK"; exit;
 
@@ -731,7 +736,7 @@ if (isset($update["callback_query"])) {
     }
   }
 
-  // ---- Admin: pick coupon amount to add ----
+  // ---- Admin pickers ----
   if (preg_match("/^admin_add_(500|1000|2000|4000)$/", $data, $m) && isAdmin($from_id)) {
     $amount = (int)$m[1];
     setState($from_id, "await_coupon_".$amount);
@@ -739,7 +744,6 @@ if (isset($update["callback_query"])) {
     http_response_code(200); echo "OK"; exit;
   }
 
-  // ---- Admin: pick amount to change points ----
   if (preg_match("/^setp_(500|1000|2000|4000)$/", $data, $m) && isAdmin($from_id)) {
     $amount = (int)$m[1];
     setState($from_id, "setp_".$amount);
